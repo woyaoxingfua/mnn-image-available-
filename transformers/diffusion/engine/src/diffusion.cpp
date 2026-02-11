@@ -92,7 +92,6 @@ Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType 
         return new StableDiffusion(modelPath, modelType, backendType, memoryMode);
     }
 }
-
 // ===== Image Processing Utility Functions =====
 
 VARP Diffusion::resizeAndCenterCrop(VARP image, int targetW, int targetH) {
