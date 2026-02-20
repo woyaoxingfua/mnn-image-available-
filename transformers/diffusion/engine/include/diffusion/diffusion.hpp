@@ -121,6 +121,7 @@ typedef enum {
     SANA_DIFFUSION = 2,
     STABLE_DIFFUSION_ZIMAGE = 3,
     LONGCAT_IMAGE_EDIT = 4,
+    FLUX2_KLEIN_DIFFUSION = 5,
     DIFFUSION_MODEL_USER
 } DiffusionModelType;
 
@@ -214,6 +215,16 @@ public:
     static void unpackLatents(const float* src, float* dst, int B, int C, int H, int W, int seqLen);
 
 protected:
+    // Shared runtime initialization: ScheduleConfig + BackendConfig + CPU fallback runtime.
+    // Returns false on failure. Subclasses call this at the start of load().
+    // gpuBufferMode: true = force BUFFER for OpenCL (ZImage/LongCat style)
+    bool initRuntimeManagers(bool gpuBufferMode = true);
+
+    // Euler update: sample + dt * noise_pred  (same for ZImage, LongCat, Flux2Klein)
+    static VARP applyEulerUpdate(VARP sample, VARP noisePred, float dt);
+
+    // Fill dst[0..size) with Philox-RNG normal samples using the given seed.
+    static void generateLatentNoise(float* dst, int size, int seed);
     std::shared_ptr<Executor::RuntimeManager> runtime_manager_;
     std::shared_ptr<Executor::RuntimeManager> runtime_manager_cpu_;
     std::vector<std::shared_ptr<Module>> mModules;
