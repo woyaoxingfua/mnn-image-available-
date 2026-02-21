@@ -681,9 +681,14 @@ bool LongCatDiffusion::run(const std::string prompt, const std::string outputPat
     if (iterNum < 1) iterNum = 10;
     
     FlowMatchEulerScheduler scheduler(mTrainTimestepsNum, mFlowShift, mUseDynamicShifting);
-    mSigmas = scheduler.get_sigmas(iterNum);
-    MNN_PRINT("[LongCat] Sigma schedule: [%.4f, %.4f, ..., %.4f]\n",
-              mSigmas[0], mSigmas.size()>1 ? mSigmas[1] : 0.f, mSigmas[iterNum-1]);
+    int imageSeqLen = (mLatentH / 2) * (mLatentW / 2);
+    if (mUseDynamicShifting) {
+        mSigmas = scheduler.get_sigmas_dynamic(iterNum, imageSeqLen);
+    } else {
+        mSigmas = scheduler.get_sigmas(iterNum);
+    }
+    MNN_PRINT("[LongCat] Sigma schedule (imageSeqLen=%d): [%.4f, %.4f, ..., %.4f]\n",
+              imageSeqLen, mSigmas[0], mSigmas.size()>1 ? mSigmas[1] : 0.f, mSigmas[iterNum-1]);
     auto text_embeddings = text_encoder_llm(prompt, vaePreprocessedImage);
     if (!text_embeddings.get()) { MNN_PRINT("Error: LLM text encoder failed\n"); return false; }
     

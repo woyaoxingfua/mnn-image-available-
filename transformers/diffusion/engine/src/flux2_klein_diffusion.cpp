@@ -84,10 +84,12 @@ Flux2KleinDiffusion::Flux2KleinDiffusion(
             MNN_PRINT("[Flux2Klein] Warning: VAE BN params not found in config.json\n");
     }
 
-    // Image/latent dimensions (align to 8)
+    // Image/latent dimensions.
+    // Must align to 16: VAE scale=8 then patchify /2, so image must be multiple of 16
+    // to ensure latent H/W are even integers.
     if (imageWidth > 0 && imageHeight > 0) {
-        mImageWidth  = ((imageWidth  + 7) / 8) * 8;
-        mImageHeight = ((imageHeight + 7) / 8) * 8;
+        mImageWidth  = ((imageWidth  + 15) / 16) * 16;
+        mImageHeight = ((imageHeight + 15) / 16) * 16;
         if (mImageWidth  < 256) mImageWidth  = 256;
         if (mImageHeight < 256) mImageHeight = 256;
     } else {
@@ -226,6 +228,9 @@ bool Flux2KleinDiffusion::load() {
     if (config.type == MNN_FORWARD_OPENCL) runtime_manager_->setCache(".tempcache");
     if (mMemoryMode == 0) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
     if (config.type == MNN_FORWARD_CPU) runtime_manager_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
+    // Enable flash attention to avoid O(N^2) memory for large seqLen (e.g. 8192 for 1024 edit).
+    // Flash attention uses block size 64, so attention score buffer is [blockKV, seqLen] instead of [seqLen, seqLen].
+    runtime_manager_->setHint(Interpreter::ATTENTION_OPTION, 8);
 
     DiffusionConfig diff_config(mModelPath);
     mModules.resize(4);
@@ -430,8 +435,22 @@ VARP Flux2KleinDiffusion::unet(VARP textEmbeds, VARP imageLatents,
         mTokenizer = nullptr;
         MNN_PRINT("[Flux2Klein] Tokenizer unloaded\n");
     }
-    // Free text encoder module
-    if (mMemoryMode != 1) mModules[0].reset();
+    // Copy textEmbeds to independent CPU tensor before freeing text encoder.
+    // textEmbeds VARP may reference memory owned by mModules[0]; reset() frees it.
+    if (mMemoryMode != 1 && textEmbeds.get()) {
+        auto info = textEmbeds->getInfo();
+        if (info) {
+            size_t n = 1; for (auto d : info->dim) n *= d;
+            std::vector<float> buf(n);
+            const float* src = textEmbeds->readMap<float>();
+            if (src) memcpy(buf.data(), src, n * sizeof(float));
+            VARP tmp = _Input(info->dim, info->order, halide_type_of<float>());
+            memcpy(tmp->writeMap<float>(), buf.data(), n * sizeof(float));
+            tmp.fix(VARP::CONSTANT);
+            textEmbeds = tmp;
+        }
+        mModules[0].reset();
+    }
     bool isT2I = !imageLatents.get();
     int pH = mLatentH/2, pW = mLatentW/2;
     int singleSeq = pH * pW;
@@ -592,6 +611,21 @@ bool Flux2KleinDiffusion::run(const std::string prompt, const std::string output
         auto inputNorm = hwcToNchw(rgbImage, true);  // normalize to [-1,1]
         imageLatents = vae_encoder(inputNorm);
         if (!imageLatents.get()) { MNN_PRINT("[Flux2Klein] VAE encode failed\n"); return false; }
+        // Copy imageLatents to independent CPU tensor before freeing VAE encoder.
+        // imageLatents VARP may reference memory owned by mModules[3]; reset() frees it.
+        {
+            auto info = imageLatents->getInfo();
+            if (info) {
+                size_t n = 1; for (auto d : info->dim) n *= d;
+                std::vector<float> buf(n);
+                const float* src = imageLatents->readMap<float>();
+                if (src) memcpy(buf.data(), src, n * sizeof(float));
+                VARP tmp = _Input(info->dim, info->order, halide_type_of<float>());
+                memcpy(tmp->writeMap<float>(), buf.data(), n * sizeof(float));
+                tmp.fix(VARP::CONSTANT);
+                imageLatents = tmp;
+            }
+        }
         if (mMemoryMode != 1) mModules[3].reset();
     }
 
@@ -603,7 +637,6 @@ bool Flux2KleinDiffusion::run(const std::string prompt, const std::string output
     auto textEmbeds = text_encoder_llm(prompt);
     if (!textEmbeds.get()) { MNN_PRINT("[Flux2Klein] Text encode failed\n"); return false; }
     if (progressCallback) progressCallback(1 * 100 / (iterNum + 3));
-
     auto latent = unet(textEmbeds, imageLatents, iterNum, randomSeed, progressCallback);
     if (!latent.get()) { MNN_PRINT("[Flux2Klein] UNet failed\n"); return false; }
 
