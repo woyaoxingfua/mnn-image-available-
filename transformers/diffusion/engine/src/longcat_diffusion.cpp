@@ -8,14 +8,8 @@
 //
 #include <random>
 #include <fstream>
-#include <chrono>
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <sstream>
-#include <iostream>
-#include <iomanip>
-#include <limits>
 #include "diffusion/longcat_diffusion.hpp"
 #include "diffusion/diffusion_config.hpp"
 #include "tokenizer.hpp"
@@ -50,44 +44,11 @@ LongCatDiffusion::LongCatDiffusion(std::string modelPath, DiffusionModelType mod
                                    int imageWidth, int imageHeight, bool textEncoderOnCPU, bool vaeOnCPU,
                                    DiffusionGpuMemoryMode gpuMemoryMode, DiffusionPrecisionMode precisionMode,
                                    DiffusionCFGMode cfgMode, int numThreads)
-    : Diffusion(modelPath, modelType, backendType, memoryMode) {
-    mTextEncoderOnCPU = textEncoderOnCPU;
-    mVaeOnCPU = vaeOnCPU;
-    mGpuMemoryMode = gpuMemoryMode;
-    mPrecisionMode = precisionMode;
-    mCFGMode = cfgMode;
-    mNumThreads = numThreads;
-    mImageWidth = imageWidth;
-    mImageHeight = imageHeight;
-    
+    : Diffusion(modelPath, modelType, backendType, memoryMode,
+                imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU,
+                gpuMemoryMode, precisionMode, cfgMode, numThreads) {
     mMaxTextLen = 128;
-    mTrainTimestepsNum = 1000;
-    mFlowShift = 3.0f;
-    mUseDynamicShifting = false;
-    
-    // Load scheduler config
-    std::string schedPath1 = mModelPath + "/scheduler/scheduler_config.json";
-    std::string schedPath2 = mModelPath + "/scheduler_config.json";
-    std::string schedPath;
-    std::ifstream sfile;
-    sfile.open(schedPath1.c_str());
-    if (sfile.good()) { schedPath = schedPath1; }
-    else { sfile.close(); sfile.open(schedPath2.c_str()); if (sfile.good()) schedPath = schedPath2; }
-    if (!schedPath.empty()) {
-        std::ostringstream oss;
-        oss << sfile.rdbuf();
-        sfile.close();
-        rapidjson::Document doc;
-        doc.Parse(oss.str().c_str());
-        if (!doc.HasParseError() && doc.IsObject()) {
-            if (doc.HasMember("num_train_timesteps") && doc["num_train_timesteps"].IsInt())
-                mTrainTimestepsNum = doc["num_train_timesteps"].GetInt();
-            if (doc.HasMember("shift") && (doc["shift"].IsFloat() || doc["shift"].IsDouble()))
-                mFlowShift = static_cast<float>(doc["shift"].GetDouble());
-            if (doc.HasMember("use_dynamic_shifting") && doc["use_dynamic_shifting"].IsBool())
-                mUseDynamicShifting = doc["use_dynamic_shifting"].GetBool();
-        }
-    }
+    loadSchedulerConfig();
     
     // Load main config.json for LongCat-specific settings
     {
@@ -141,6 +102,7 @@ LongCatDiffusion::LongCatDiffusion(std::string modelPath, DiffusionModelType mod
     }
     MNN_PRINT("[LongCat] latent=(1,%d,%d,%d), image=%dx%d\n", mLatentC, mLatentH, mLatentW, mImageWidth, mImageHeight);
 }
+
 
 LongCatDiffusion::~LongCatDiffusion() {
 #ifdef MNN_BUILD_LLM
@@ -559,20 +521,6 @@ VARP LongCatDiffusion::unet(VARP text_embeddings, int iterNum, int randomSeed, f
             noise_pred = outputs[0];  // [1, seq, 64] - keep NLC format for slice+unpack
         }
         
-        // Debug: print UNet output stats on first step
-        if (i == 0) {
-            auto dbgInfo = noise_pred->getInfo();
-            MNN_PRINT("[LongCat DBG] UNet output shape: [");
-            for (int d = 0; d < (int)dbgInfo->dim.size(); ++d) MNN_PRINT("%d%s", dbgInfo->dim[d], d+1<(int)dbgInfo->dim.size()?",":"");
-            MNN_PRINT("]\n");
-            const float* dbgPtr = noise_pred->readMap<float>();
-            if (dbgPtr) {
-                float mn=dbgPtr[0], mx=dbgPtr[0], sum=0; int n=std::min(100,(int)dbgInfo->size);
-                for(int k=0;k<n;++k){mn=std::min(mn,dbgPtr[k]);mx=std::max(mx,dbgPtr[k]);sum+=dbgPtr[k];}
-                MNN_PRINT("[LongCat DBG] UNet out[0:100] min=%.4f max=%.4f mean=%.4f\n", mn, mx, sum/n);
-            }
-        }
-        
         // Preprocess (GPU slice + unpack) then Euler update
         auto noise_pred_standard = mUNetPreprocess(noise_pred);
         auto updated = Diffusion::applyEulerUpdate(plms, noise_pred_standard, dt);
@@ -595,52 +543,13 @@ VARP LongCatDiffusion::unet(VARP text_embeddings, int iterNum, int randomSeed, f
 
 VARP LongCatDiffusion::vae_decoder(VARP latent) {
     if (mMemoryMode != 1) mModules[1].reset();
-    
-    // Debug: latent stats before VAE scaling
-    {
-        auto info = latent->getInfo();
-        MNN_PRINT("[LongCat DBG] latent shape before VAE: [");
-        for (int d = 0; d < (int)info->dim.size(); ++d) MNN_PRINT("%d%s", info->dim[d], d+1<(int)info->dim.size()?",":"");
-        MNN_PRINT("]\n");
-        const float* p = latent->readMap<float>();
-        if (p) {
-            float mn=p[0], mx=p[0], sum=0; int n=std::min(200,(int)info->size);
-            for(int k=0;k<n;++k){mn=std::min(mn,p[k]);mx=std::max(mx,p[k]);sum+=p[k];}
-            MNN_PRINT("[LongCat DBG] latent min=%.4f max=%.4f mean=%.4f\n", mn, mx, sum/n);
-        }
-    }
-    
-    // LongCat VAE scaling
-    float scalingFactor = 0.3611f;
-    float shiftFactor = 0.1159f;
-    latent = latent / _Const(scalingFactor) + _Const(shiftFactor);
-    
+
+    // LongCat VAE scaling: latents = latents / scaling_factor + shift_factor
+    latent = latent / _Const(0.3611f) + _Const(0.1159f);
+
     AUTOTIME;
     auto outputs = mModules[2]->onForward({latent});
-    auto output = _Convert(outputs[0], NCHW);
-    
-    // Debug: VAE output stats
-    {
-        auto info = output->getInfo();
-        MNN_PRINT("[LongCat DBG] VAE output shape: [");
-        for (int d = 0; d < (int)info->dim.size(); ++d) MNN_PRINT("%d%s", info->dim[d], d+1<(int)info->dim.size()?",":"");
-        MNN_PRINT("]\n");
-        const float* p = output->readMap<float>();
-        if (p) {
-            float mn=p[0], mx=p[0], sum=0; int n=std::min(200,(int)info->size);
-            for(int k=0;k<n;++k){mn=std::min(mn,p[k]);mx=std::max(mx,p[k]);sum+=p[k];}
-            MNN_PRINT("[LongCat DBG] VAE out min=%.4f max=%.4f mean=%.4f\n", mn, mx, sum/n);
-        }
-    }
-    
-    auto image = output;
-    image = _Relu6(image * _Const(0.5) + _Const(0.5), 0, 1);
-    image = _Squeeze(_Transpose(image, {0, 2, 3, 1}));
-    image = _Cast(_Round(image * _Const(255.0)), halide_type_of<uint8_t>());
-    image = cvtColor(image, COLOR_BGR2RGB);
-    image.fix(VARP::CONSTANT);
-    MNN_PRINT("[LongCat] VAE decoder output ready\n");
-    return image;
+    return nchwFloatToHwcBGR(_Convert(outputs[0], NCHW));
 }
 
 bool LongCatDiffusion::run(const std::string prompt, const std::string imagePath, int iterNum, int randomSeed, std::function<void(int)> progressCallback) {

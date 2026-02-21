@@ -7,9 +7,6 @@
 #include "diffusion/flux2_klein_diffusion.hpp"
 #include "diffusion/diffusion_config.hpp"
 #include "scheduler.hpp"
-#ifdef MNN_BUILD_LLM
-#include "llm/tokenizer.hpp"
-#endif
 #include <rapidjson/document.h>
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
@@ -26,28 +23,20 @@ Flux2KleinDiffusion::Flux2KleinDiffusion(
     int imageWidth, int imageHeight, bool textEncoderOnCPU, bool vaeOnCPU,
     DiffusionGpuMemoryMode gpuMemoryMode, DiffusionPrecisionMode precisionMode,
     DiffusionCFGMode cfgMode, int numThreads)
-    : Diffusion(modelPath, modelType, backendType, memoryMode) {
-    mTextEncoderOnCPU = textEncoderOnCPU;
-    mVaeOnCPU = vaeOnCPU;
-    mGpuMemoryMode = gpuMemoryMode;
-    mPrecisionMode = precisionMode;
-    mCFGMode = cfgMode;
-    mNumThreads = numThreads;
+    : Diffusion(modelPath, modelType, backendType, memoryMode,
+                imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU,
+                gpuMemoryMode, precisionMode, cfgMode, numThreads) {
 
-    // Load scheduler config
-    for (auto& schedPath : {mModelPath + "/scheduler/scheduler_config.json",
-                             mModelPath + "/scheduler_config.json"}) {
+    // Load base scheduler config (num_train_timesteps, shift, use_dynamic_shifting)
+    loadSchedulerConfig();
+    // Load Flux2Klein-specific scheduler fields (base_shift, max_shift, seq_len bounds)
+    for (const auto& schedPath : {mModelPath + "/scheduler/scheduler_config.json",
+                                   mModelPath + "/scheduler_config.json"}) {
         std::ifstream f(schedPath.c_str());
         if (!f.good()) continue;
         std::ostringstream oss; oss << f.rdbuf();
         rapidjson::Document doc; doc.Parse(oss.str().c_str());
         if (doc.HasParseError() || !doc.IsObject()) continue;
-        if (doc.HasMember("num_train_timesteps") && doc["num_train_timesteps"].IsInt())
-            mTrainTimestepsNum = doc["num_train_timesteps"].GetInt();
-        if (doc.HasMember("shift") && (doc["shift"].IsFloat() || doc["shift"].IsDouble()))
-            mFlowShift = (float)doc["shift"].GetDouble();
-        if (doc.HasMember("use_dynamic_shifting") && doc["use_dynamic_shifting"].IsBool())
-            mUseDynamicShifting = doc["use_dynamic_shifting"].GetBool();
         if (doc.HasMember("base_shift") && (doc["base_shift"].IsFloat() || doc["base_shift"].IsDouble()))
             mBaseShift = (float)doc["base_shift"].GetDouble();
         if (doc.HasMember("max_shift") && (doc["max_shift"].IsFloat() || doc["max_shift"].IsDouble()))
@@ -102,12 +91,7 @@ Flux2KleinDiffusion::Flux2KleinDiffusion(
 }
 
 Flux2KleinDiffusion::~Flux2KleinDiffusion() {
-    if (mTokenizer) {
-#ifdef MNN_BUILD_LLM
-        delete static_cast<MNN::Transformer::Tokenizer*>(mTokenizer);
-#endif
-        mTokenizer = nullptr;
-    }
+    // mTokenizer is unique_ptr, auto-destroyed
 }
 
 // ===== Scheduler helpers =====
@@ -200,38 +184,11 @@ void Flux2KleinDiffusion::prepareTxtIds(float* dst, int seqLen) const {
 // ===== load() =====
 bool Flux2KleinDiffusion::load() {
     AUTOTIME;
-    ScheduleConfig config;
-    BackendConfig backendConfig;
-    config.type = mBackendType;
-    if (config.type == MNN_FORWARD_CPU) {
-        config.numThread = mNumThreads;
-    } else if (config.type == MNN_FORWARD_OPENCL) {
-        int gpuMode = MNN_GPU_TUNING_FAST | MNN_GPU_MEMORY_BUFFER;
-        if (mGpuMemoryMode == GPU_MEMORY_IMAGE) gpuMode = MNN_GPU_TUNING_FAST | MNN_GPU_MEMORY_IMAGE;
-        config.mode = gpuMode;
-    } else {
-        config.numThread = 1;
-    }
-    backendConfig.memory = BackendConfig::Memory_Low;
-    if (mPrecisionMode == PRECISION_LOW)       backendConfig.precision = BackendConfig::Precision_Low;
-    else if (mPrecisionMode == PRECISION_HIGH) backendConfig.precision = BackendConfig::Precision_High;
-    else                                       backendConfig.precision = BackendConfig::Precision_Normal;
-    config.backendConfig = &backendConfig;
-
-    auto exe = ExecutorScope::Current();
-    exe->lazyEval = false;
-    exe->setGlobalExecutorConfig(config.type, backendConfig, config.numThread);
+    // Enable flash attention (ATTENTION_OPTION=8) to avoid O(N^2) memory for large seqLen
+    // (e.g. 8192 for 1024 edit). Flash attention uses block size 64.
+    if (!initRuntimeManagers(/*gpuBufferMode=*/true, /*attentionHint=*/8)) return false;
 
     Module::Config mc; mc.shapeMutable = true;
-    runtime_manager_.reset(Executor::RuntimeManager::createRuntimeManager(config));
-    if (!runtime_manager_) { MNN_ERROR("[Flux2Klein] Failed to create runtime\n"); return false; }
-    if (config.type == MNN_FORWARD_OPENCL) runtime_manager_->setCache(".tempcache");
-    if (mMemoryMode == 0) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
-    if (config.type == MNN_FORWARD_CPU) runtime_manager_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
-    // Enable flash attention to avoid O(N^2) memory for large seqLen (e.g. 8192 for 1024 edit).
-    // Flash attention uses block size 64, so attention score buffer is [blockKV, seqLen] instead of [seqLen, seqLen].
-    runtime_manager_->setHint(Interpreter::ATTENTION_OPTION, 8);
-
     DiffusionConfig diff_config(mModelPath);
     mModules.resize(4);
 
@@ -241,15 +198,8 @@ bool Flux2KleinDiffusion::load() {
         MNN_PRINT("[Flux2Klein] Load text encoder: %s\n", path.c_str());
         Module::Config tec; tec.shapeMutable = true;
         // Use CPU runtime for text encoder if requested
-        if (mTextEncoderOnCPU && config.type != MNN_FORWARD_CPU) {
-            ScheduleConfig cpuCfg; cpuCfg.type = MNN_FORWARD_CPU; cpuCfg.numThread = mNumThreads;
-            BackendConfig cpuBe; cpuBe.memory = BackendConfig::Memory_Low;
-            cpuCfg.backendConfig = &cpuBe;
-            runtime_manager_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuCfg));
-            mModules[0].reset(Module::load({"input_ids","attention_mask"},{"prompt_embeds"}, path.c_str(), runtime_manager_cpu_, &tec));
-        } else {
-            mModules[0].reset(Module::load({"input_ids","attention_mask"},{"prompt_embeds"}, path.c_str(), runtime_manager_, &tec));
-        }
+        auto& te_runtime = runtime_manager_cpu_ ? runtime_manager_cpu_ : runtime_manager_;
+        mModules[0].reset(Module::load({"input_ids","attention_mask"},{"prompt_embeds"}, path.c_str(), te_runtime, &tec));
         if (!mModules[0]) { MNN_ERROR("[Flux2Klein] Failed to load text encoder\n"); return false; }
     }
 
@@ -295,17 +245,16 @@ VARP Flux2KleinDiffusion::text_encoder_llm(const std::string& prompt) {
 #ifdef MNN_BUILD_LLM
     if (!mTokenizer) {
         std::string tokPath = mModelPath + "/tokenizer.txt";
-        mTokenizer = MNN::Transformer::Tokenizer::createTokenizer(tokPath);
+        mTokenizer.reset(MNN::Transformer::Tokenizer::createTokenizer(tokPath));
         if (mTokenizer)
             MNN_PRINT("[Flux2Klein] Tokenizer loaded: %s\n", tokPath.c_str());
         else
             MNN_PRINT("[Flux2Klein] Warning: tokenizer load failed: %s\n", tokPath.c_str());
     }
     if (mTokenizer) {
-        auto tok = static_cast<MNN::Transformer::Tokenizer*>(mTokenizer);
         // Apply Qwen3 chat_template (hardcoded, user-only, no thinking)
         std::string templated = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
-        inputIds = tok->encode(templated);
+        inputIds = mTokenizer->encode(templated);
         MNN_PRINT("[Flux2Klein] Tokens after chat_template: %d\n", (int)inputIds.size());
     }
 #endif
@@ -351,19 +300,11 @@ VARP Flux2KleinDiffusion::text_encoder_llm(const std::string& prompt) {
 
 // ===== VAE Decoder =====
 VARP Flux2KleinDiffusion::vae_decoder(VARP latent) {
-    // Free transformer to save memory
     if (mMemoryMode != 1) mModules[1].reset();
     AUTOTIME;
     auto outs = mModules[2]->onForward({latent});
     if (outs.empty()) { MNN_PRINT("[Flux2Klein] VAE decode failed\n"); return nullptr; }
-    // Output: [B,3,H,W] in [-1,1] -> convert to [H,W,3] uint8 BGR
-    auto out = _Convert(outs[0], NCHW);
-    auto img = _Relu6(out * _Const(0.5f) + _Const(0.5f), 0.f, 1.f);
-    img = _Squeeze(_Transpose(img, {0,2,3,1}));
-    img = _Cast(_Round(img * _Const(255.f)), halide_type_of<uint8_t>());
-    img = cvtColor(img, COLOR_BGR2RGB);
-    img.fix(VARP::CONSTANT);
-    return img;
+    return nchwFloatToHwcBGR(_Convert(outs[0], NCHW));
 }
 
 // ===== VAE Encoder =====
@@ -417,24 +358,18 @@ VARP Flux2KleinDiffusion::vae_encoder(VARP image) {
     return patchVar;
 }
 
-// ===== Euler Update =====
-VARP Flux2KleinDiffusion::applyEulerUpdate(VARP sample, VARP noisePred, float dt) {
-    return sample + _Scalar(dt) * noisePred;
-}
-
 
 // ===== UNet (Denoising Loop) =====
 VARP Flux2KleinDiffusion::unet(VARP textEmbeds, VARP imageLatents,
                                 int iterNum, int randomSeed,
                                 std::function<void(int)> progressCallback) {
     // Free tokenizer to save memory before denoising
-    if (mMemoryMode != 1 && mTokenizer) {
 #ifdef MNN_BUILD_LLM
-        delete static_cast<MNN::Transformer::Tokenizer*>(mTokenizer);
-#endif
-        mTokenizer = nullptr;
+    if (mMemoryMode != 1 && mTokenizer) {
+        mTokenizer.reset();
         MNN_PRINT("[Flux2Klein] Tokenizer unloaded\n");
     }
+#endif
     // Copy textEmbeds to independent CPU tensor before freeing text encoder.
     // textEmbeds VARP may reference memory owned by mModules[0]; reset() frees it.
     if (mMemoryMode != 1 && textEmbeds.get()) {

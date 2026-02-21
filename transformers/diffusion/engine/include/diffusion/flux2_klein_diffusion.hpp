@@ -7,6 +7,9 @@
 #include <vector>
 #include <string>
 #include <functional>
+#ifdef MNN_BUILD_LLM
+#include "llm/tokenizer.hpp"
+#endif
 
 namespace MNN {
 namespace DIFFUSION {
@@ -46,8 +49,6 @@ private:
               std::function<void(int)> progressCallback);
     VARP vae_decoder(VARP latent);
     VARP vae_encoder(VARP image);
-    VARP applyEulerUpdate(VARP sample, VARP noisePred, float dt);
-
     float computeEmpiricalMu(int imageSeqLen, int numSteps) const;
     std::vector<float> getSigmas(int numSteps, int imageSeqLen) const;
 
@@ -57,10 +58,7 @@ private:
     void prepareImgIds(float* dst, int H, int W, int seqOffset = 0, float t_coord = 0.f) const;
     void prepareTxtIds(float* dst, int seqLen) const;
 
-    // Scheduler params
-    int   mTrainTimestepsNum  = 1000;
-    float mFlowShift          = 3.0f;
-    bool  mUseDynamicShifting = true;
+    // Flux2Klein-specific scheduler params (base params are in Diffusion base class)
     float mBaseShift          = 0.5f;
     float mMaxShift           = 1.15f;
     int   mBaseImageSeqLen    = 256;
@@ -74,8 +72,10 @@ private:
 
     // Text encoder
     // chat_template hardcoded: "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    int   mTextSeqLen = 512;
-    void* mTokenizer  = nullptr;  // MNN::Transformer::Tokenizer*
+    int mTextSeqLen = 512;
+#ifdef MNN_BUILD_LLM
+    std::unique_ptr<MNN::Transformer::Tokenizer> mTokenizer;
+#endif
 
     // VAE BN normalization params (patchify + BN normalize after VAE encode)
     // Loaded from config.json vae.bn_mean / vae.bn_std (128 channels)

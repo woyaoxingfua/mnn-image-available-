@@ -8,14 +8,8 @@
 //
 #include <random>
 #include <fstream>
-#include <chrono>
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <sstream>
-#include <iostream>
-#include <iomanip>
-#include <limits>
 #include "diffusion/zimage_diffusion.hpp"
 #include "diffusion/diffusion_config.hpp"
 #include "tokenizer.hpp"
@@ -105,45 +99,12 @@ ZImageDiffusion::ZImageDiffusion(std::string modelPath, DiffusionModelType model
                                  int imageWidth, int imageHeight, bool textEncoderOnCPU, bool vaeOnCPU,
                                  DiffusionGpuMemoryMode gpuMemoryMode, DiffusionPrecisionMode precisionMode,
                                  DiffusionCFGMode cfgMode, int numThreads)
-    : Diffusion(modelPath, modelType, backendType, memoryMode) {
-    mTextEncoderOnCPU = textEncoderOnCPU;
-    mVaeOnCPU = vaeOnCPU;
-    mGpuMemoryMode = gpuMemoryMode;
-    mPrecisionMode = precisionMode;
-    mCFGMode = cfgMode;
-    mNumThreads = numThreads;
-    mImageWidth = imageWidth;
-    mImageHeight = imageHeight;
-    
+    : Diffusion(modelPath, modelType, backendType, memoryMode,
+                imageWidth, imageHeight, textEncoderOnCPU, vaeOnCPU,
+                gpuMemoryMode, precisionMode, cfgMode, numThreads) {
     mMaxTextLen = 128;
-    mTrainTimestepsNum = 1000;
-    mFlowShift = 3.0f;
-    mUseDynamicShifting = false;
-    
-    // Load scheduler config if available
-    std::string schedPath1 = mModelPath + "/scheduler/scheduler_config.json";
-    std::string schedPath2 = mModelPath + "/scheduler_config.json";
-    std::string schedPath;
-    std::ifstream sfile;
-    sfile.open(schedPath1.c_str());
-    if (sfile.good()) { schedPath = schedPath1; }
-    else { sfile.close(); sfile.open(schedPath2.c_str()); if (sfile.good()) schedPath = schedPath2; }
-    if (!schedPath.empty()) {
-        std::ostringstream oss;
-        oss << sfile.rdbuf();
-        sfile.close();
-        rapidjson::Document doc;
-        doc.Parse(oss.str().c_str());
-        if (!doc.HasParseError() && doc.IsObject()) {
-            if (doc.HasMember("num_train_timesteps") && doc["num_train_timesteps"].IsInt())
-                mTrainTimestepsNum = doc["num_train_timesteps"].GetInt();
-            if (doc.HasMember("shift") && (doc["shift"].IsFloat() || doc["shift"].IsDouble()))
-                mFlowShift = static_cast<float>(doc["shift"].GetDouble());
-            if (doc.HasMember("use_dynamic_shifting") && doc["use_dynamic_shifting"].IsBool())
-                mUseDynamicShifting = doc["use_dynamic_shifting"].GetBool();
-        }
-    }
-    
+    loadSchedulerConfig();
+
     // Set latent dimensions
     mLatentC = 16;
     if (mImageWidth > 0 && mImageHeight > 0) {
@@ -335,25 +296,15 @@ VARP ZImageDiffusion::unet(VARP text_embeddings, int iterNum, int randomSeed, fl
 }
 
 VARP ZImageDiffusion::vae_decoder(VARP latent) {
-    if (mMemoryMode != 1) {
-        mModules[1].reset();  // Unload UNet
-    }
-    
+    if (mMemoryMode != 1) mModules[1].reset();
+
     // Z-image VAE: latents = (latents / scaling_factor) + shift_factor
     // scaling_factor=0.3611, shift_factor=0.1159 (from vae/config.json)
     latent = latent * _Const(1.0f / 0.3611f) + _Const(0.1159f);
-    
+
     AUTOTIME;
     auto outputs = mModules[2]->onForward({latent});
-    auto output = _Convert(outputs[0], NCHW);
-    
-    auto image = output;
-    image = _Relu6(image * _Const(0.5) + _Const(0.5), 0, 1);
-    image = _Squeeze(_Transpose(image, {0, 2, 3, 1}));
-    image = _Cast(_Round(image * _Const(255.0)), halide_type_of<uint8_t>());
-    image = cvtColor(image, COLOR_BGR2RGB);
-    image.fix(VARP::CONSTANT);
-    return image;
+    return nchwFloatToHwcBGR(_Convert(outputs[0], NCHW));
 }
 
 bool ZImageDiffusion::run(const std::string prompt, const std::string imagePath, int iterNum, int randomSeed, std::function<void(int)> progressCallback) {

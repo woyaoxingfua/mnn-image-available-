@@ -2,10 +2,12 @@
 #include <fstream>
 #include <chrono>
 #include <array>
+#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <MNN/expr/ExecutorScope.hpp>
+#include <rapidjson/document.h>
 #include "diffusion/diffusion.hpp"
 #include "diffusion/stable_diffusion.hpp"
 #include "diffusion/sana_diffusion.hpp"
@@ -58,6 +60,17 @@ Diffusion::Diffusion(std::string modelPath, DiffusionModelType modelType, MNNFor
 mModelPath(modelPath), mModelType(modelType), mBackendType(backendType), mMemoryMode(memoryMode) {
 }
 
+Diffusion::Diffusion(std::string modelPath, DiffusionModelType modelType, MNNForwardType backendType, int memoryMode,
+                     int imageWidth, int imageHeight, bool textEncoderOnCPU, bool vaeOnCPU,
+                     DiffusionGpuMemoryMode gpuMemoryMode, DiffusionPrecisionMode precisionMode,
+                     DiffusionCFGMode cfgMode, int numThreads)
+    : mModelPath(modelPath), mModelType(modelType), mBackendType(backendType), mMemoryMode(memoryMode),
+      mImageWidth(imageWidth), mImageHeight(imageHeight),
+      mTextEncoderOnCPU(textEncoderOnCPU), mVaeOnCPU(vaeOnCPU),
+      mGpuMemoryMode(gpuMemoryMode), mPrecisionMode(precisionMode),
+      mCFGMode(cfgMode), mNumThreads(numThreads) {
+}
+
 Diffusion::~Diffusion() {
     mModules.clear();
     runtime_manager_.reset();
@@ -72,7 +85,25 @@ bool Diffusion::run(const std::string prompt, const std::string outputPath, int 
 
 // ===== Shared Protected Helpers =====
 
-bool Diffusion::initRuntimeManagers(bool gpuBufferMode) {
+void Diffusion::loadSchedulerConfig() {
+    for (const auto& path : {mModelPath + "/scheduler/scheduler_config.json",
+                              mModelPath + "/scheduler_config.json"}) {
+        std::ifstream f(path.c_str());
+        if (!f.good()) continue;
+        std::ostringstream oss; oss << f.rdbuf();
+        rapidjson::Document doc; doc.Parse(oss.str().c_str());
+        if (doc.HasParseError() || !doc.IsObject()) continue;
+        if (doc.HasMember("num_train_timesteps") && doc["num_train_timesteps"].IsInt())
+            mTrainTimestepsNum = doc["num_train_timesteps"].GetInt();
+        if (doc.HasMember("shift") && (doc["shift"].IsFloat() || doc["shift"].IsDouble()))
+            mFlowShift = static_cast<float>(doc["shift"].GetDouble());
+        if (doc.HasMember("use_dynamic_shifting") && doc["use_dynamic_shifting"].IsBool())
+            mUseDynamicShifting = doc["use_dynamic_shifting"].GetBool();
+        break;
+    }
+}
+
+bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
     ScheduleConfig config;
     BackendConfig backendConfig;
     config.type = mBackendType;
@@ -116,6 +147,8 @@ bool Diffusion::initRuntimeManagers(bool gpuBufferMode) {
     else if (mMemoryMode == 2) runtime_manager_->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 1);
     if (config.type == MNN_FORWARD_CPU)
         runtime_manager_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
+    if (attentionHint > 0)
+        runtime_manager_->setHint(Interpreter::ATTENTION_OPTION, attentionHint);
 
     // CPU fallback runtime for text encoder on GPU backends
     if (mTextEncoderOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
@@ -171,6 +204,15 @@ Diffusion* Diffusion::createDiffusion(std::string modelPath, DiffusionModelType 
     }
 }
 // ===== Image Processing Utility Functions =====
+
+VARP Diffusion::nchwFloatToHwcBGR(VARP nchwFloat) {
+    auto img = _Relu6(nchwFloat * _Const(0.5f) + _Const(0.5f), 0.f, 1.f);
+    img = _Squeeze(_Transpose(img, {0, 2, 3, 1}));
+    img = _Cast(_Round(img * _Const(255.f)), halide_type_of<uint8_t>());
+    img = cvtColor(img, COLOR_BGR2RGB);
+    img.fix(VARP::CONSTANT);
+    return img;
+}
 
 VARP Diffusion::resizeAndCenterCrop(VARP image, int targetW, int targetH) {
     auto info = image->getInfo();
