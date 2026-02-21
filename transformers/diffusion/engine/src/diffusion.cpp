@@ -162,6 +162,18 @@ bool Diffusion::initRuntimeManagers(bool gpuBufferMode, int attentionHint) {
         runtime_manager_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
         runtime_manager_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
     }
+    // CPU fallback runtime for VAE on GPU backends
+    if (mVaeOnCPU && (config.type == MNN_FORWARD_OPENCL || config.type == MNN_FORWARD_VULKAN)) {
+        ScheduleConfig cpuConfig;
+        cpuConfig.type = MNN_FORWARD_CPU;
+        cpuConfig.numThread = mNumThreads;
+        BackendConfig cpuBC;
+        cpuBC.memory    = BackendConfig::Memory_Low;
+        cpuBC.precision = BackendConfig::Precision_Normal;
+        cpuConfig.backendConfig = &cpuBC;
+        runtime_manager_vae_cpu_.reset(Executor::RuntimeManager::createRuntimeManager(cpuConfig));
+        runtime_manager_vae_cpu_->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 0);
+    }
     return true;
 }
 

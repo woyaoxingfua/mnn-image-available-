@@ -239,7 +239,8 @@ protected:
     // Fill dst[0..size) with Philox-RNG normal samples using the given seed.
     static void generateLatentNoise(float* dst, int size, int seed);
     std::shared_ptr<Executor::RuntimeManager> runtime_manager_;
-    std::shared_ptr<Executor::RuntimeManager> runtime_manager_cpu_;
+    std::shared_ptr<Executor::RuntimeManager> runtime_manager_cpu_;     // TE on CPU
+    std::shared_ptr<Executor::RuntimeManager> runtime_manager_vae_cpu_; // VAE on CPU
     std::vector<std::shared_ptr<Module>> mModules;
     
     std::string mModelPath;

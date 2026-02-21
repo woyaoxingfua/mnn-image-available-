@@ -216,7 +216,8 @@ bool Flux2KleinDiffusion::load() {
     {
         auto path = diff_config.vae_decoder_model();
         MNN_PRINT("[Flux2Klein] Load VAE decoder: %s\n", path.c_str());
-        mModules[2].reset(Module::load({"latent_sample"},{"sample"}, path.c_str(), runtime_manager_, &mc));  // shared_ptr overload
+        auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+        mModules[2].reset(Module::load({"latent_sample"},{"sample"}, path.c_str(), vae_runtime, &mc));
         if (!mModules[2]) { MNN_ERROR("[Flux2Klein] Failed to load VAE decoder\n"); return false; }
         mModules[2]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
     }
@@ -224,7 +225,8 @@ bool Flux2KleinDiffusion::load() {
     {
         auto path = diff_config.vae_encoder_model();
         MNN_PRINT("[Flux2Klein] Load VAE encoder: %s\n", path.c_str());
-        mModules[3].reset(Module::load({"sample"},{"latent_sample"}, path.c_str(), runtime_manager_, &mc));  // shared_ptr overload
+        auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+        mModules[3].reset(Module::load({"sample"},{"latent_sample"}, path.c_str(), vae_runtime, &mc));
         if (!mModules[3]) { MNN_ERROR("[Flux2Klein] Failed to load VAE encoder\n"); return false; }
         mModules[3]->traceOrOptimize(MNN::Interpreter::Session_Resize_Fix);
     }

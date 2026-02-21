@@ -163,7 +163,8 @@ bool ZImageDiffusion::load() {
     {
         std::string model_path = diff_config.vae_decoder_model();
         MNN_PRINT("Load %s\n", model_path.c_str());
-        mModules[2].reset(Module::load({"latent_sample"}, {"sample"}, model_path.c_str(), runtime_manager_, &module_config));
+        auto& vae_runtime = runtime_manager_vae_cpu_ ? runtime_manager_vae_cpu_ : runtime_manager_;
+        mModules[2].reset(Module::load({"latent_sample"}, {"sample"}, model_path.c_str(), vae_runtime, &module_config));
     }
     
     // Load tokenizer
