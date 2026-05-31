@@ -20,6 +20,7 @@ on:
       - 'test/**'
       - 'project/android/**'
       - '.github/workflows/android.yml'
+  workflow_dispatch:  # 添加手动触发
 
 concurrency:
   group: android-${{ github.ref }}
