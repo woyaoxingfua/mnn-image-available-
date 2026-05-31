@@ -1,0 +1,79 @@
+name: android
+
+on:
+  push:
+    branches:
+      - master
+      - feature/**
+    paths:
+      - 'source/**'
+      - 'express/**'
+      - 'test/**'
+      - 'project/android/**'
+      - '.github/workflows/build_android.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'source/**'
+      - 'express/**'
+      - 'test/**'
+      - 'project/android/**'
+      - '.github/workflows/build_android.yml'
+  workflow_dispatch:  # 添加手动触发
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  android_build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Build Android Library for 64-bit
+        run: |
+          cd project/android
+          mkdir -p build_64
+          cd build_64
+          ../build_64.sh -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DLLM_SUPPORT_VISION=true -DMNN_BUILD_OPENCV=true
+
+      - name: Build Android Library for 32-bit
+        run: |
+          cd project/android
+          mkdir -p build_32
+          cd build_32
+          ../build_32.sh -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DLLM_SUPPORT_AUDIO=true -DMNN_BUILD_AUDIO=true
+
+      - name: Initialize Gradle Wrapper
+        run: ./gradlew --version
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-apk
+          path: app/build/outputs/apk/release/*.apk
