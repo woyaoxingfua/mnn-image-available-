@@ -57,23 +57,28 @@ jobs:
           cd build_32
           ../build_32.sh -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DLLM_SUPPORT_AUDIO=true -DMNN_BUILD_AUDIO=true
 
+      # 修复点：gradlew 不在仓库根目录，而在 project/android/gradlew
       - name: Initialize Gradle Wrapper
         run: ./gradlew --version
+        working-directory: project/android
 
       - name: Build Debug APK
         run: ./gradlew assembleDebug
+        working-directory: project/android
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          # 修复点：APK 输出在 project/android 下的各个 module 的 build/outputs 里
+          path: project/android/**/build/outputs/apk/debug/*.apk
 
       - name: Build Release APK
         run: ./gradlew assembleRelease
+        working-directory: project/android
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: project/android/**/build/outputs/apk/release/*.apk
