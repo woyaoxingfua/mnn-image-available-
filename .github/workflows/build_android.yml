@@ -61,21 +61,21 @@ jobs:
         working-directory: project/android
         run: ./gradlew --version
 
-      - name: Build Debug APK
+      - name: Build Debug AAR
         working-directory: project/android
         run: ./gradlew assembleDebug
 
-      - name: Upload Debug APK
+      - name: Upload Debug AAR
         uses: actions/upload-artifact@v3
         with:
           name: debug-aar
           path: project/android/build/outputs/aar/*debug.aar
 
-      - name: Build Release APK
+      - name: Build Release AAR
         working-directory: project/android
         run: ./gradlew assembleRelease
 
-      - name: Upload Release APK
+      - name: Upload Release AAR
         uses: actions/upload-artifact@v3
         with:
           name: release-aar
