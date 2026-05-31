@@ -58,22 +58,25 @@ jobs:
           ../build_32.sh -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DLLM_SUPPORT_AUDIO=true -DMNN_BUILD_AUDIO=true
 
       - name: Initialize Gradle Wrapper
+        working-directory: project/android
         run: ./gradlew --version
 
       - name: Build Debug APK
+        working-directory: project/android
         run: ./gradlew assembleDebug
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v3
         with:
           name: debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: project/android/build/outputs/aar/*debug.aar
 
       - name: Build Release APK
+        working-directory: project/android
         run: ./gradlew assembleRelease
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v3
         with:
           name: release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: project/android/build/outputs/aar/*release.aar
